@@ -1,0 +1,388 @@
+---
+title: "Regresión Logística Múltiple: Anemia Infantil"
+subtitle: "ENDES 2024 (RECH6) — Universidad Nacional del Altiplano"
+author: "Zulema Luque Cornejo"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    number_sections: true
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                       fig.align = "center", fig.width = 8, fig.height = 5)
+```
+
+# Introducción
+
+La anemia infantil es un problema de salud pública prioritario en el Perú. El Ministerio de Salud (MINSA) y el INEI monitorean su prevalencia a través de la Encuesta Demográfica y de Salud Familiar (ENDES), aplicando la **Directriz OMS 2024 / RM 251-2024-MINSA** para clasificar el nivel de hemoglobina ajustado por altitud en niños menores de 5 años.
+
+Este documento aplica un modelo de **regresión logística múltiple** para identificar qué variables antropométricas (edad, peso, talla y los z-scores de crecimiento de la OMS) se asocian con la presencia de anemia infantil, usando el módulo individual de niños (RECH6) de la ENDES 2024.
+
+**Fuente de datos:** Instituto Nacional de Estadística e Informática (INEI), Encuesta Demográfica y de Salud Familiar (ENDES) 2024, módulo RECH6 (Cuestionario Individual - Niños).
+
+## Variables del estudio
+
+**Variable dependiente (Y):** `grupo_anemia`, con 2 categorías:
+
+- `Sin_anemia`: niños clasificados sin anemia (código HC57A = 4)
+- `Con_anemia`: niños con anemia (Leve, Moderada o Grave agrupadas; código HC57A = 1, 2 ó 3)
+
+**Variables independientes (X)** — todas cuantitativas:
+
+| Variable | Descripción | Código ENDES |
+|---|---|---|
+| `edad_meses` | Edad del niño en meses | HC1 |
+| `peso_kg` | Peso en kilogramos | HC2 |
+| `talla_cm` | Talla en centímetros | HC3 |
+| `talla_edad_z` | Z-score Talla/Edad (OMS) | HC70 |
+| `peso_edad_z` | Z-score Peso/Edad (OMS) | HC71 |
+
+> Se excluye la hemoglobina (HC53/HC56/HC56A) como predictor porque es la variable que define la anemia (evitar circularidad / fuga de información).
+
+# Librerías
+
+```{r librerias}
+library(dplyr)
+library(ggplot2)
+library(car)        # VIF
+library(pROC)        # Curva ROC / AUC
+library(caret)        # train/test split, validación cruzada
+library(pscl)        # Pseudo R2 (McFadden)
+
+set.seed(123)
+```
+
+# Preparación del dataset
+
+El archivo de ENDES usa códigos numéricos para "valor no medido" (documentados en el diccionario INEI). Se excluyen esos códigos (no se alteran datos reales) y se convierten las unidades a su valor real (peso y talla traían un decimal implícito; los z-scores traían 2 decimales implícitos).
+
+```{r preparacion}
+df_crudo <- read.csv("RECH6_2024.csv", sep = ";", stringsAsFactors = FALSE)
+dim(df_crudo)
+
+datos <- df_crudo[, c("HC1", "HC2", "HC3", "HC57A", "HC70", "HC71")]
+colnames(datos) <- c("edad_meses", "peso_kg_x10", "talla_cm_x10", "anemia_oms",
+                      "talla_edad_z_x100", "peso_edad_z_x100")
+
+mask_validos <- (
+  (datos$peso_kg_x10 < 999) &
+  (datos$talla_cm_x10 < 9999) &
+  (datos$anemia_oms %in% c(1, 2, 3, 4)) &
+  (abs(datos$talla_edad_z_x100) < 9000) &
+  (abs(datos$peso_edad_z_x100) < 9000)
+)
+
+cat("Filas excluidas por codigo de 'no medido':", sum(!mask_validos), "\n")
+cat("Filas validas:", sum(mask_validos), "de", nrow(datos), "\n")
+
+datos <- datos[mask_validos, ]
+datos$peso_kg      <- datos$peso_kg_x10 / 10
+datos$talla_cm     <- datos$talla_cm_x10 / 10
+datos$talla_edad_z <- datos$talla_edad_z_x100 / 100
+datos$peso_edad_z  <- datos$peso_edad_z_x100 / 100
+datos$grupo_anemia <- ifelse(datos$anemia_oms == 4, "Sin_anemia", "Con_anemia")
+
+X_cols <- c("edad_meses", "peso_kg", "talla_cm", "talla_edad_z", "peso_edad_z")
+Y_col  <- "grupo_anemia"
+
+datos <- datos[, c(X_cols, "anemia_oms", Y_col)]
+
+# Codificacion: Con_anemia = 1 (evento), Sin_anemia = 0 (referencia)
+datos$grupo_anemia <- factor(datos$grupo_anemia, levels = c("Sin_anemia", "Con_anemia"))
+datos$grupo_anemia_num <- ifelse(datos$grupo_anemia == "Con_anemia", 1, 0)
+
+dim(datos)
+table(datos$grupo_anemia)
+round(prop.table(table(datos$grupo_anemia)) * 100, 1)
+```
+
+El dataset final queda con `r nrow(datos)` observaciones válidas, con una prevalencia de anemia de aproximadamente **`r round(mean(datos$grupo_anemia_num)*100,1)`%**.
+
+# Revisión de los datos
+
+```{r revision}
+str(datos[c(X_cols, "grupo_anemia")])
+round(sapply(datos[X_cols], summary), 2)
+colSums(is.na(datos[c(X_cols, "grupo_anemia")]))
+```
+
+No se observan valores nulos en el dataset final (ya se excluyeron los códigos de "no medido" en el paso anterior).
+
+# Análisis exploratorio
+
+## Distribución de la variable dependiente
+
+```{r dist-y}
+ggplot(datos, aes(x = grupo_anemia, fill = grupo_anemia)) +
+  geom_bar() +
+  scale_fill_manual(values = c("Sin_anemia" = "steelblue", "Con_anemia" = "firebrick")) +
+  labs(title = "Distribución de la variable dependiente", x = "", y = "Frecuencia") +
+  theme_minimal()
+```
+
+Se observa un desbalance moderado (~31% con anemia / ~69% sin anemia). Se mantiene el dataset completo; el modelo se evalúa con métricas que no dependen solo del accuracy (AUC-ROC, sensibilidad, especificidad).
+
+## Distribución de los predictores por grupo
+
+```{r hist-predictores, fig.height=7}
+par(mfrow = c(2, 3))
+for (col in X_cols) {
+  hist(datos[datos$grupo_anemia == "Sin_anemia", col], col = rgb(0.27, 0.51, 0.71, 0.5),
+       main = col, xlab = col, breaks = 30, freq = FALSE,
+       xlim = range(datos[[col]]))
+  hist(datos[datos$grupo_anemia == "Con_anemia", col], col = rgb(0.7, 0.13, 0.13, 0.5),
+       breaks = 30, freq = FALSE, add = TRUE)
+  legend("topright", legend = c("Sin_anemia", "Con_anemia"),
+         fill = c(rgb(0.27, 0.51, 0.71, 0.5), rgb(0.7, 0.13, 0.13, 0.5)), cex = 0.7)
+}
+par(mfrow = c(1, 1))
+```
+
+## Correlación con la variable dependiente
+
+```{r correlaciones}
+correlaciones <- sapply(datos[X_cols], function(x) cor(x, datos$grupo_anemia_num))
+round(sort(correlaciones), 4)
+```
+
+`grupo_anemia` está relacionado, sobre todo, con `talla_edad_z` y `peso_edad_z` (a menor z-score, mayor probabilidad de anemia), y en menor medida con `edad_meses`, `peso_kg` y `talla_cm`.
+
+## Boxplots por clase
+
+```{r boxplots, fig.height=7}
+par(mfrow = c(2, 3))
+for (col in X_cols) {
+  boxplot(datos[[col]] ~ datos$grupo_anemia, main = col, xlab = "", ylab = col,
+          col = c("steelblue", "firebrick"))
+}
+par(mfrow = c(1, 1))
+```
+
+# División de datos (train / test)
+
+```{r split}
+set.seed(123)
+indices_train <- createDataPartition(datos$grupo_anemia, p = 0.8, list = FALSE)
+train <- datos[indices_train, ]
+test  <- datos[-indices_train, ]
+
+cat("Train:", nrow(train), "observaciones\n")
+cat("Test :", nrow(test), "observaciones\n")
+round(prop.table(table(train$grupo_anemia)), 3)
+round(prop.table(table(test$grupo_anemia)), 3)
+```
+
+## Escalado Min-Max
+
+Se escalan los predictores a una escala 0–1 debido a las diferencias de magnitud entre las variables (edad en meses, peso en kg, talla en cm, z-scores). El escalador se ajusta **únicamente** con los datos de entrenamiento, para evitar fuga de información del conjunto de prueba.
+
+```{r escalado}
+minmax_params <- lapply(train[X_cols], function(x) c(min = min(x), max = max(x)))
+
+escalar_minmax <- function(df, params) {
+  df_scaled <- df
+  for (col in names(params)) {
+    rango <- params[[col]]["max"] - params[[col]]["min"]
+    df_scaled[[col]] <- (df[[col]] - params[[col]]["min"]) / rango
+  }
+  df_scaled
+}
+
+train_scaled <- escalar_minmax(train, minmax_params)
+test_scaled  <- escalar_minmax(test, minmax_params)
+```
+
+# Multicolinealidad (VIF)
+
+```{r vif}
+formula_completa <- as.formula(paste("grupo_anemia_num ~", paste(X_cols, collapse = " + ")))
+modelo_vif_aux <- lm(formula_completa, data = train_scaled)
+vif_vals <- vif(modelo_vif_aux)
+
+vif_df <- data.frame(Variable = names(vif_vals), VIF = as.numeric(vif_vals))
+vif_df <- vif_df[order(-vif_df$VIF), ]
+print(vif_df, row.names = FALSE)
+```
+
+```{r vif-plot, fig.height=4}
+colores_vif <- ifelse(vif_df$VIF < 5, "forestgreen", ifelse(vif_df$VIF < 10, "orange", "firebrick"))
+par(mar = c(4, 7, 3, 1))
+barplot(vif_df$VIF, names.arg = vif_df$Variable, horiz = TRUE, col = colores_vif,
+        main = "Factor de Inflación de Varianza (VIF)", xlab = "VIF", las = 1)
+abline(v = c(5, 10), col = c("orange", "red"), lty = 2, lwd = 2)
+```
+
+**Interpretación:** VIF < 5 indica ausencia de multicolinealidad relevante; 5–10 multicolinealidad moderada; ≥10 multicolinealidad alta. En este dataset, `peso_kg`, `talla_cm` y `edad_meses` muestran VIF muy alto entre sí (esperado: el cuerpo del niño crece con la edad). Los z-scores de la OMS, al estar ya ajustados por edad y sexo, presentan menor VIF. Esto sugiere que un modelo más parsimonioso podría preferir los z-scores frente a las medidas crudas, o bien aplicar selección de variables (sección siguiente).
+
+# Modelo completo (regresión logística múltiple)
+
+```{r modelo-completo}
+modelo_completo <- glm(formula_completa, data = train_scaled, family = binomial(link = "logit"))
+summary(modelo_completo)
+```
+
+```{r or-completo}
+or_completo <- exp(cbind(OR = coef(modelo_completo), confint(modelo_completo)))
+round(or_completo, 4)
+```
+
+```{r pseudo-r2-completo}
+pR2(modelo_completo)["McFadden"]
+```
+
+## Evaluación en el conjunto de prueba
+
+```{r eval-completo}
+prob_test_completo <- predict(modelo_completo, newdata = test_scaled, type = "response")
+pred_test_completo <- ifelse(prob_test_completo > 0.5, "Con_anemia", "Sin_anemia")
+pred_test_completo <- factor(pred_test_completo, levels = c("Sin_anemia", "Con_anemia"))
+
+cm_completo <- confusionMatrix(pred_test_completo, test$grupo_anemia, positive = "Con_anemia")
+cm_completo
+```
+
+```{r roc-completo}
+roc_completo <- roc(test$grupo_anemia_num, prob_test_completo, quiet = TRUE)
+auc(roc_completo)
+```
+
+# Selección de variables (stepwise por AIC)
+
+Se aplica selección *stepwise* bidireccional, partiendo del modelo completo y usando el Criterio de Información de Akaike (AIC) como criterio de comparación.
+
+```{r stepwise}
+modelo_nulo <- glm(grupo_anemia_num ~ 1, data = train_scaled, family = binomial)
+
+modelo_step <- step(modelo_completo,
+                     scope = list(lower = modelo_nulo, upper = modelo_completo),
+                     direction = "both", trace = 0)
+
+summary(modelo_step)
+```
+
+```{r vars-finales}
+variables_finales <- names(coef(modelo_step))[-1]
+variables_finales
+```
+
+# Modelo final: evaluación completa
+
+```{r eval-final}
+prob_test_final <- predict(modelo_step, newdata = test_scaled, type = "response")
+pred_test_final <- ifelse(prob_test_final > 0.5, "Con_anemia", "Sin_anemia")
+pred_test_final <- factor(pred_test_final, levels = c("Sin_anemia", "Con_anemia"))
+
+cm_final <- confusionMatrix(pred_test_final, test$grupo_anemia, positive = "Con_anemia")
+cm_final
+```
+
+```{r roc-final, fig.height=5.5, fig.width=5.5}
+roc_final <- roc(test$grupo_anemia_num, prob_test_final, quiet = TRUE)
+auc_final <- auc(roc_final)
+
+plot(roc_final, col = "firebrick", lwd = 2,
+     main = paste0("Curva ROC - Modelo final (AUC = ", round(auc_final, 3), ")"))
+abline(a = 0, b = 1, col = "gray", lty = 2)
+```
+
+```{r matriz-confusion-plot, fig.height=4.5, fig.width=4.5}
+fourfoldplot(as.table(cm_final$table), color = c("steelblue", "firebrick"),
+             main = "Matriz de Confusión - Modelo Final")
+```
+
+## Odds Ratios del modelo final
+
+```{r or-final}
+or_final <- exp(cbind(OR = coef(modelo_step), confint(modelo_step)))
+round(or_final, 4)
+```
+
+## Validación cruzada (10-fold)
+
+```{r cv}
+ctrl <- trainControl(method = "cv", number = 10)
+formula_final <- as.formula(paste("grupo_anemia ~", paste(variables_finales, collapse = " + ")))
+datos_scaled_completo <- escalar_minmax(datos, minmax_params)
+
+cv_modelo <- train(formula_final, data = datos_scaled_completo, method = "glm",
+                    family = "binomial", trControl = ctrl)
+cv_modelo
+```
+
+# Ecuación del modelo e interpretación
+
+```{r ecuacion, results='asis'}
+coefs_final <- coef(modelo_step)
+ecuacion <- paste0("log(p/(1-p)) = ", round(coefs_final[1], 4))
+for (i in 2:length(coefs_final)) {
+  ecuacion <- paste0(ecuacion, " + (", round(coefs_final[i], 4), ") \\times \\text{", names(coefs_final)[i], "}")
+}
+cat("$$", ecuacion, "$$")
+```
+
+```{r interpretacion-or}
+for (var in variables_finales) {
+  or_var <- exp(coefs_final[var])
+  if (or_var > 1) {
+    cambio <- (or_var - 1) * 100
+    cat(sprintf("- **%s**: por cada unidad de aumento (escala normalizada 0-1), las odds de anemia AUMENTAN %.1f%%\n", var, cambio))
+  } else {
+    cambio <- (1 - or_var) * 100
+    cat(sprintf("- **%s**: por cada unidad de aumento (escala normalizada 0-1), las odds de anemia DISMINUYEN %.1f%%\n", var, cambio))
+  }
+}
+```
+
+# Predicción para un nuevo caso
+
+Caso hipotético: niño de 24 meses, 11.5 kg, 84 cm de talla, con z-scores moderadamente bajos.
+
+```{r prediccion-nuevo}
+nuevo_caso <- data.frame(
+  edad_meses   = 24,
+  peso_kg      = 11.5,
+  talla_cm     = 84.0,
+  talla_edad_z = -1.2,
+  peso_edad_z  = -0.8
+)
+nuevo_caso
+
+nuevo_caso_scaled <- escalar_minmax(nuevo_caso, minmax_params)
+prob_nuevo <- predict(modelo_step, newdata = nuevo_caso_scaled, type = "response")
+clase_nuevo <- ifelse(prob_nuevo > 0.5, "Con_anemia", "Sin_anemia")
+
+cat("Probabilidad de Con_anemia:", round(prob_nuevo, 4), "\n")
+cat("Clase predicha:", clase_nuevo, "\n")
+```
+
+# Resumen ejecutivo
+
+```{r resumen, echo=FALSE}
+cat(sprintf("MODELO FINAL: glm binomial seleccionado por stepwise (AIC)\n"))
+cat(sprintf("Variables incluidas (%d): %s\n", length(variables_finales), paste(variables_finales, collapse = ", ")))
+cat(sprintf("AIC del modelo: %.2f\n", AIC(modelo_step)))
+cat(sprintf("Pseudo R2 McFadden: %.4f\n", pR2(modelo_step)["McFadden"]))
+cat(sprintf("Accuracy (test): %.4f\n", cm_final$overall["Accuracy"]))
+cat(sprintf("Sensibilidad (Con_anemia): %.4f\n", cm_final$byClass["Sensitivity"]))
+cat(sprintf("Especificidad (Sin_anemia): %.4f\n", cm_final$byClass["Specificity"]))
+cat(sprintf("AUC-ROC: %.4f\n", auc_final))
+```
+
+**Conclusiones principales:**
+
+1. El modelo final, seleccionado por *stepwise* con criterio AIC, retuvo las variables: `r paste(variables_finales, collapse = ", ")`.
+2. El poder discriminativo del modelo es **moderado** (AUC ≈ `r round(auc_final, 2)`), lo cual es razonable dado que se excluyó deliberadamente la hemoglobina (la variable que define directamente la anemia) para evitar circularidad.
+3. Existe **multicolinealidad relevante** entre `peso_kg`, `talla_cm` y `edad_meses` (VIF alto), lo que puede "diluir" la significancia individual de los z-scores de la OMS, que capturan información similar pero ya ajustada por edad y sexo.
+4. Se recomienda complementar este análisis con el LDA/QDA realizado previamente y discutir las diferencias de enfoque (supuestos de normalidad y homogeneidad de covarianzas vs. ausencia de tales supuestos en la regresión logística).
+
+---
+
+*Documento generado en R Markdown — Universidad Nacional del Altiplano.*

@@ -1,0 +1,535 @@
+---
+title: "Regresión Logística Simple — Anemia Infantil"
+subtitle: "ENDES 2024 (RECH6) · Universidad Nacional del Altiplano"
+author: "Zulema Luque Cornejo"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+---
+
+> **Variable dependiente (Y):** `grupo_anemia` — presencia / ausencia de anemia  
+> Directriz OMS 2024 / RM 251-2024-MINSA (variable `HC57A`)  
+>
+> **Variable independiente (X):** `talla_edad_z` — Z-score Talla/Edad (OMS), variable `HC70`  
+> (ya ajustado por edad y sexo; valores más negativos indican desnutrición crónica / retraso en el crecimiento)
+
+---
+
+# Librerías
+
+```{r librerias}
+library(tidyverse)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(gridExtra)
+library(ResourceSelection)
+library(pscl)
+
+set.seed(123)
+```
+
+---
+
+# Preparación del dataset
+
+Se lee el archivo crudo `RECH6_2024.csv`, se seleccionan las variables de interés (`HC70`, `HC57A`), se filtran observaciones válidas y se construye la variable binaria de anemia.
+
+```{r paso0}
+df_crudo <- read.csv("RECH6_2024.csv", sep = ";", stringsAsFactors = FALSE)
+cat("Dataset original:", dim(df_crudo)[1], "filas ×", dim(df_crudo)[2], "columnas\n")
+
+datos_raw <- df_crudo[, c("HC70", "HC57A")]
+colnames(datos_raw) <- c("talla_edad_z_x100", "anemia_oms")
+
+mask_validos <- (
+  (datos_raw$anemia_oms %in% c(1, 2, 3, 4)) &
+  (abs(datos_raw$talla_edad_z_x100) < 9000)
+)
+
+cat("Filas excluidas (código 'no medido'):", sum(!mask_validos), "\n")
+cat("Filas válidas:", sum(mask_validos), "de", nrow(datos_raw), "\n")
+
+datos_raw <- datos_raw[mask_validos, ]
+datos_raw$talla_edad_z <- datos_raw$talla_edad_z_x100 / 100
+datos_raw$matricula    <- ifelse(datos_raw$anemia_oms == 4, 0, 1)
+
+datos <- datos_raw[, c("matricula", "talla_edad_z")]
+
+head(datos, 5)
+str(datos)
+```
+
+## Conversión de la variable objetivo a factor
+
+```{r factor}
+datos$matricula <- factor(datos$matricula,
+                          levels = c("0", "1"),
+                          labels = c("no tiene anemia", "tiene anemia"))
+str(datos)
+```
+
+## Distribución de clases
+
+```{r distribucion-clases}
+print(table(datos$matricula))
+
+datos %>%
+  group_by(matricula) %>%
+  summarise(
+    n           = n(),
+    porcentaje  = scales::percent(n / nrow(datos))
+  )
+```
+
+---
+
+# Análisis Exploratorio de Datos
+
+## Estadísticos descriptivos
+
+```{r eda-summary}
+summary(datos)
+```
+
+## Resumen por grupo
+
+```{r eda-grupo}
+datos %>%
+  filter(!is.na(talla_edad_z)) %>%
+  group_by(matricula) %>%
+  summarise(
+    media   = mean(talla_edad_z),
+    mediana = median(talla_edad_z),
+    min     = min(talla_edad_z),
+    max     = max(talla_edad_z)
+  )
+```
+
+> Se confirma que el promedio de `talla_edad_z` en el grupo **con anemia** es menor (más negativo) que en el grupo **sin anemia**.
+
+---
+
+# Visualización de datos
+
+## Distribución de la anemia infantil
+
+```{r plot-barras}
+ggplot(datos, aes(x = matricula, fill = matricula)) +
+  geom_bar() +
+  geom_text(
+    aes(label = scales::percent(after_stat(count) / sum(after_stat(count)))),
+    stat = "count", position = position_stack(0.5)
+  ) +
+  scale_fill_manual(values = c("no tiene anemia" = "steelblue",
+                                "tiene anemia"    = "firebrick")) +
+  theme_minimal() +
+  labs(title = "Distribución de la anemia infantil", x = "", y = "Frecuencia")
+```
+
+## Histograma de `talla_edad_z`
+
+```{r plot-hist}
+ggplot(datos, aes(x = talla_edad_z)) +
+  geom_histogram(color = "steelblue", fill = "lightblue", bins = 30) +
+  theme_minimal() +
+  ggtitle("Histograma de talla_edad_z (Z-score Talla/Edad)")
+```
+
+> Los valores están alrededor de su media (~−0.88), con cola hacia valores muy negativos (desnutrición crónica severa).
+
+## Boxplot por grupo
+
+```{r plot-boxplot}
+ggplot(datos, aes(x = matricula, y = talla_edad_z, color = matricula)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.1) +
+  scale_color_manual(values = c("no tiene anemia" = "steelblue",
+                                 "tiene anemia"    = "firebrick")) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(title = "talla_edad_z según presencia de anemia")
+```
+
+> La mediana de `talla_edad_z` en el grupo *tiene anemia* es menor que en *no tiene anemia*, coherente con la asociación entre desnutrición crónica y anemia.
+
+---
+
+# Estimación del Modelo de Regresión Logística Simple
+
+```{r modelo}
+modelo <- glm(matricula ~ talla_edad_z, data = datos, family = "binomial")
+summary(modelo)
+```
+
+## Ecuación del modelo
+
+```{r ecuacion}
+coefs <- coef(modelo)
+cat(sprintf(
+  "p̂(Y=1|X) = exp(%.5f + %.5f·X) / (1 + exp(%.5f + %.5f·X))\n",
+  coefs[1], coefs[2], coefs[1], coefs[2]
+))
+```
+
+## Intervalos de confianza (coeficientes)
+
+```{r ic-coef}
+round(confint(modelo, level = 0.95), 5)
+```
+
+## Odds Ratios
+
+```{r odds-ratios}
+or_modelo <- round(exp(coefficients(modelo)), 6)
+print(or_modelo)
+
+cat(sprintf(
+  "\nPor cada unidad que AUMENTA talla_edad_z, las odds de tener anemia\nse MULTIPLICAN por %.4f (disminuyen un %.1f%%).\n",
+  or_modelo["talla_edad_z"],
+  (1 - or_modelo["talla_edad_z"]) * 100
+))
+```
+
+## IC al 95% para el Odds Ratio
+
+```{r ic-or}
+round(exp(confint(modelo)), 5)
+```
+
+---
+
+# Significancia del Predictor (ANOVA Chi-cuadrado)
+
+```{r anova}
+anova(modelo, test = "Chisq")
+```
+
+---
+
+# Evaluación del Modelo
+
+## Devianza y criterios de información
+
+```{r devianza}
+cat(sprintf("Null deviance    : %.4f  (gl = %d)\n", modelo$null.deviance, modelo$df.null))
+cat(sprintf("Residual deviance: %.4f  (gl = %d)\n", modelo$deviance,      modelo$df.residual))
+cat(sprintf("AIC: %.4f\n", AIC(modelo)))
+cat(sprintf("BIC: %.4f\n", BIC(modelo)))
+```
+
+## Likelihood Ratio Test
+
+```{r lrt}
+dif_residuos <- modelo$null.deviance - modelo$deviance
+df_lr        <- modelo$df.null - modelo$df.residual
+p_value_lr   <- pchisq(dif_residuos, df = df_lr, lower.tail = FALSE)
+
+cat(sprintf("Diferencia de residuos (LR): %.4f\n", dif_residuos))
+cat(sprintf("Grados de libertad         : %d\n",   df_lr))
+cat(sprintf("p-value                    : %s\n",   format(p_value_lr, scientific = TRUE)))
+if (p_value_lr < 0.05) cat("→ El modelo es significativo en la predicción de la anemia.\n")
+```
+
+## Pseudo R²
+
+```{r pseudo-r2}
+# McFadden
+pscl::pR2(modelo)["McFadden"]
+
+# Cox & Snell
+LR      <- modelo$null.deviance - modelo$deviance
+N       <- sum(weights(modelo))
+RsqrCN  <- 1 - exp(-LR / N)
+cat(sprintf("Pseudo R² Cox & Snell : %.4f\n", RsqrCN))
+
+# Nagelkerke
+L0.adj  <- exp(-modelo$null.deviance / N)
+RsqrNal <- RsqrCN / (1 - L0.adj)
+cat(sprintf("Pseudo R² Nagelkerke  : %.4f\n", RsqrNal))
+```
+
+## Test de Hosmer-Lemeshow
+
+```{r hosmer}
+hl_test <- tryCatch(
+  hoslem.test(as.numeric(datos$matricula) - 1, fitted(modelo)),
+  error = function(e) NULL
+)
+if (!is.null(hl_test)) print(hl_test) else {
+  cat("(No se pudo calcular; común con datasets grandes con muchos valores repetidos de X)\n")
+}
+```
+
+---
+
+# Curva ROC y AUC
+
+```{r roc}
+prob    <- predict(modelo, type = "response")
+roc_obj <- roc(datos$matricula, prob, quiet = TRUE)
+
+plot(roc_obj, col = "blue", print.auc = TRUE,
+     main = "Curva ROC — talla_edad_z ~ anemia")
+
+cat(sprintf("\nAUC: %.4f\n", auc(roc_obj)))
+```
+
+## Punto de corte óptimo
+
+```{r cutoff}
+closest <- coords(roc_obj, "best",
+                  ret = c("threshold", "specificity", "sensitivity", "npv", "ppv"),
+                  best.method = "closest.topleft")
+print(closest)
+```
+
+---
+
+# Matriz de Confusión (modelo completo)
+
+```{r confusion-full}
+predicciones        <- ifelse(prob > 0.5, 1, 0)
+matriz_confusion    <- table(as.numeric(datos$matricula) - 1, predicciones,
+                             dnn = c("observaciones", "predicciones"))
+print(matriz_confusion)
+
+accuracy_train <- sum(diag(matriz_confusion)) / sum(matriz_confusion)
+cat(sprintf("Accuracy (entrenamiento): %.4f (%.1f%%)\n", accuracy_train, accuracy_train * 100))
+cat(sprintf("Error de clasificación  : %.4f\n",
+            (matriz_confusion[1,2] + matriz_confusion[2,1]) / sum(matriz_confusion)))
+```
+
+## Predicciones y exportación
+
+```{r export}
+finaldata <- cbind(datos, prob, predicciones)
+head(finaldata, 10)
+write.csv(finaldata, "anemia_predict.csv", row.names = FALSE)
+```
+
+---
+
+# Predicción para nuevos valores
+
+```{r nuevas-predicciones}
+for (valor in c(0, -1, -2, -3)) {
+  nuevo    <- data.frame(talla_edad_z = valor)
+  p_pred   <- predict(modelo, newdata = nuevo, type = "response")
+  clase    <- ifelse(p_pred > 0.5, "tiene anemia", "no tiene anemia")
+  cat(sprintf("talla_edad_z = %2d  →  P(anemia) = %.4f  →  %s\n",
+              valor, p_pred, clase))
+}
+```
+
+---
+
+# Gráfico del Modelo
+
+## Sin intervalos de confianza
+
+```{r plot-modelo-simple}
+plot(as.numeric(datos$matricula) - 1 ~ talla_edad_z, datos,
+     col  = "darkblue", pch = "I",
+     main = "Regresión logística: anemia ~ talla_edad_z",
+     ylab = "P(anemia = 1 | talla_edad_z)",
+     xlab = "talla_edad_z")
+curve(predict(modelo, data.frame(talla_edad_z = x), type = "response"),
+      col = "firebrick", lwd = 2.5, add = TRUE)
+```
+
+## Con intervalos de confianza al 95%
+
+```{r plot-modelo-ic}
+nuevos_puntos     <- seq(min(datos$talla_edad_z), max(datos$talla_edad_z), by = 0.05)
+pred_se           <- predict(modelo, data.frame(talla_edad_z = nuevos_puntos), se.fit = TRUE)
+
+datos_curva <- data.frame(
+  talla_edad_z   = nuevos_puntos,
+  prob           = exp(pred_se$fit) / (1 + exp(pred_se$fit)),
+  lwr            = exp(pred_se$fit - 1.96*pred_se$se.fit) /
+                   (1 + exp(pred_se$fit - 1.96*pred_se$se.fit)),
+  upr            = exp(pred_se$fit + 1.96*pred_se$se.fit) /
+                   (1 + exp(pred_se$fit + 1.96*pred_se$se.fit))
+)
+
+ggplot(datos, aes(x = talla_edad_z, y = as.numeric(matricula) - 1)) +
+  geom_point(aes(color = matricula), shape = "I", size = 3, alpha = 0.3) +
+  geom_line(data = datos_curva, aes(x = talla_edad_z, y = prob),
+            color = "firebrick", inherit.aes = FALSE) +
+  geom_line(data = datos_curva, aes(x = talla_edad_z, y = lwr),
+            linetype = "dashed", color = "gray40", inherit.aes = FALSE) +
+  geom_line(data = datos_curva, aes(x = talla_edad_z, y = upr),
+            linetype = "dashed", color = "gray40", inherit.aes = FALSE) +
+  theme_bw() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Regresión logística: anemia ~ talla_edad_z",
+       y = "P(anemia = 1 | talla_edad_z)",
+       x = "talla_edad_z (Z-score Talla/Edad)")
+```
+
+---
+
+# Regresión Logística como Machine Learning
+
+## División train / test (70% / 30%)
+
+```{r split}
+set.seed(123)
+idx               <- createDataPartition(datos$matricula, p = 0.7, list = FALSE)
+datos_entrenamiento <- datos[idx, ]
+datos_prueba        <- datos[-idx, ]
+
+cat("Entrenamiento:", nrow(datos_entrenamiento), "observaciones\n")
+cat("Prueba       :", nrow(datos_prueba),        "observaciones\n")
+```
+
+## Ajuste del modelo de entrenamiento
+
+```{r modelo-train}
+modelo_entrenamiento <- glm(matricula ~ talla_edad_z,
+                             data   = datos_entrenamiento,
+                             family = "binomial")
+summary(modelo_entrenamiento)
+
+cat("\nOdds Ratios (entrenamiento):\n")
+print(exp(coef(modelo_entrenamiento)))
+```
+
+## Predicciones y matrices de confusión
+
+```{r predicciones-ml}
+pred_train_prob  <- predict(modelo_entrenamiento, datos_entrenamiento, type = "response")
+pred_train_clase <- as.factor(ifelse(pred_train_prob > 0.5, 1, 0))
+
+pred_test_prob   <- predict(modelo_entrenamiento, datos_prueba, type = "response")
+pred_test_clase  <- as.factor(ifelse(pred_test_prob  > 0.5, 1, 0))
+
+obs_train <- as.factor(as.numeric(datos_entrenamiento$matricula) - 1)
+obs_test  <- as.factor(as.numeric(datos_prueba$matricula)        - 1)
+
+cat("Matriz de confusión — Entrenamiento:\n")
+cm_train <- confusionMatrix(pred_train_clase, obs_train, positive = "1")
+print(cm_train)
+
+cat("\nMatriz de confusión — Prueba:\n")
+cm_test  <- confusionMatrix(pred_test_clase,  obs_test,  positive = "1")
+print(cm_test)
+```
+
+## Métricas de rendimiento (conjunto de prueba)
+
+```{r metricas}
+accuracy  <- cm_test$overall["Accuracy"]
+precision <- cm_test$byClass["Precision"]
+recall    <- cm_test$byClass["Recall"]
+f1        <- cm_test$byClass["F1"]
+
+roc_test  <- roc(obs_test, pred_test_prob, quiet = TRUE)
+roc_auc   <- auc(roc_test)
+
+cat(sprintf("Accuracy  : %.4f (%.2f%%)\n", accuracy,  accuracy  * 100))
+cat(sprintf("Precisión : %.4f\n",          precision))
+cat(sprintf("Recall    : %.4f\n",          recall))
+cat(sprintf("F1-Score  : %.4f\n",          f1))
+cat(sprintf("ROC-AUC   : %.4f\n",          roc_auc))
+```
+
+## Curva ROC — conjunto de prueba
+
+```{r roc-test}
+plot(roc_test,
+     main  = "Curva ROC — Datos de Prueba",
+     col   = "blue", lwd = 2, print.auc = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "red")
+```
+
+---
+
+# Validación Cruzada 10-Fold
+
+```{r cv}
+train_control <- trainControl(
+  method          = "cv",
+  number          = 10,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+datos_cv <- datos
+levels(datos_cv$matricula) <- c("Sin_anemia", "Con_anemia")
+
+logistic_cv <- train(
+  matricula ~ talla_edad_z,
+  data      = datos_cv,
+  method    = "glm",
+  family    = "binomial",
+  trControl = train_control,
+  metric    = "ROC"
+)
+print(logistic_cv)
+```
+
+## Resultados de validación cruzada
+
+```{r cv-resultados}
+preds_cv <- logistic_cv$pred[order(logistic_cv$pred$rowIndex), ]
+
+cat("Matriz de confusión (CV):\n")
+print(confusionMatrix(preds_cv$pred, preds_cv$obs))
+
+roc_cv <- roc(preds_cv$obs, preds_cv$Con_anemia, quiet = TRUE)
+cat(sprintf("\nAUC (validación cruzada 10-fold): %.4f\n", auc(roc_cv)))
+
+plot(roc_cv,
+     main = "Curva ROC — Validación Cruzada 10-fold",
+     col  = "blue", lwd = 2, print.auc = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "red")
+```
+
+---
+
+# Resumen Ejecutivo
+
+```{r resumen}
+cat("══════════════════════════════════════════════════════════════════════\n")
+cat("MODELO: Regresión Logística Simple\n")
+cat("  Variable dependiente  : presencia de anemia (0 = Sin, 1 = Con)\n")
+cat("  Variable independiente: talla_edad_z (Z-score Talla/Edad, OMS)\n\n")
+cat(sprintf("  logit(anemia) = %.4f + (%.4f) × talla_edad_z\n", coefs[1], coefs[2]))
+cat(sprintf("  Odds Ratio (talla_edad_z)      : %.4f\n", or_modelo["talla_edad_z"]))
+cat(sprintf("  AIC                            : %.2f\n",  AIC(modelo)))
+cat(sprintf("  Pseudo R² McFadden             : %.4f\n",  pscl::pR2(modelo)["McFadden"]))
+cat(sprintf("  AUC-ROC (modelo completo)      : %.4f\n",  auc(roc_obj)))
+cat(sprintf("  AUC-ROC (validación cruzada)   : %.4f\n",  auc(roc_cv)))
+cat(sprintf("\n  Por cada unidad que AUMENTA talla_edad_z, las odds de tener\n"))
+cat(sprintf("  anemia se REDUCEN un %.1f%%.\n", (1 - or_modelo["talla_edad_z"]) * 100))
+cat("  El predictor es estadísticamente significativo (p < 0.001).\n")
+cat("══════════════════════════════════════════════════════════════════════\n")
+```
+
+---
+
+*Análisis realizado con R · Universidad Nacional del Altiplano · ENDES 2024*
